@@ -1,44 +1,7 @@
 from machine import Pin, PWM, ADC
 import time
-import math
 
-# ===================== 编码器类 =====================
-class Encoder:
-    def __init__(self, pinA, pinB):
-        self.pinA = Pin(pinA, Pin.IN, Pin.PULL_UP)
-        self.pinB = Pin(pinB, Pin.IN, Pin.PULL_UP)
-        self.count = 0
-        self.last_count = 0
-        self.speed = 0
-        self.last_time = time.ticks_ms()
-        
-        self.pinA.irq(trigger=Pin.IRQ_RISING | Pin.IRQ_FALLING, handler=self._irq_handler)
-        
-    def _irq_handler(self, pin):
-        a_val = self.pinA.value()
-        b_val = self.pinB.value()
-        if a_val == b_val:
-            self.count += 1
-        else:
-            self.count -= 1
-    
-    def update_speed(self):
-        current_time = time.ticks_ms()
-        dt = time.ticks_diff(current_time, self.last_time) / 1000.0
-        if dt > 0:
-            delta_count = self.count - self.last_count
-            self.speed = delta_count / dt
-            self.last_count = self.count
-            self.last_time = current_time
-        return self.speed
-    
-    def get_count(self): return self.count
-    def reset(self):
-        self.count = 0
-        self.last_count = 0
-        self.speed = 0
-
-# ===================== PID控制器【极致防抖参数】 =====================
+# ===================== PID控制器【优化防抖参数】 =====================
 class PIDController:
     def __init__(self, kp, ki, kd, setpoint=0, output_limits=(-1023, 1023)):
         self.kp = kp
@@ -50,18 +13,18 @@ class PIDController:
         self._last_error = 0
         self._last_time = time.ticks_ms()
         self._last_output = 0.0
-        self._output_smoothing = 0.22  # 更大平滑，输出无突变
-    
+        self._output_smoothing = 0.30
+
     def update(self, measured_value, dt=None):
         if dt is None:
             current_time = time.ticks_ms()
             dt = time.ticks_diff(current_time, self._last_time) / 1000.0
             self._last_time = current_time
-        if dt <= 0: dt = 0.005
+        if dt <= 0:
+            dt = 0.005
         error = self.setpoint - measured_value
         p_term = self.kp * error
 
-        # 仅偏移很大时才积分，直线完全关闭积分
         if abs(error) < 1.0:
             self._integral += error * dt
         else:
@@ -78,19 +41,20 @@ class PIDController:
         self._last_output = output
         self._last_error = error
         return output
-    
+
     def reset(self):
         self._integral = 0
         self._last_error = 0
         self._last_output = 0.0
 
-# ===================== 光电采样（统一阈值100） =====================
+# ===================== 光电采样 =====================
 class PhotoelectricSampler:
     def __init__(self):
         self.adc_pins = {'left1':27,'left2':33,'mid':32,'right2':35,'right1':34}
         self.sensor_thresholds = [140, 140, 140, 140, 140]
         self.adc_objects = {}
         self._init_adc()
+
     def _init_adc(self):
         print("初始化ADC通道...")
         for name,pin in self.adc_pins.items():
@@ -99,12 +63,14 @@ class PhotoelectricSampler:
             adc.width(ADC.WIDTH_12BIT)
             self.adc_objects[name] = adc
             print(f"  {name} GPIO{pin} OK")
+
     def read_all(self):
         res = {}
         for name,adc in self.adc_objects.items():
             val = adc.read()
             res[name] = {"raw":val,"volt":val/4095*3.6}
         return res
+
     def get_line_position(self):
         sensors = self.read_all()
         names = ['left1','left2','mid','right2','right1']
@@ -121,58 +87,65 @@ class PhotoelectricSampler:
         pos = pos/total if total>0 else 0
         return pos,binary,sensors
 
-# ===================== 电机控制 =====================
+# ===================== 电机控制（移除编码器相关代码） =====================
 class MotorController:
     def __init__(self, base_speed=650, min_speed=480, max_speed=800):
-        self.L1=PWM(Pin(15,0),freq=20000,duty=0)
-        self.L2=PWM(Pin(13,0),freq=20000,duty=0)
-        self.R1=PWM(Pin(14,0),freq=20000,duty=0)
-        self.R2=PWM(Pin(25,0),freq=20000,duty=0)
-        self.MAX_SPEED=max_speed
-        self.MIN_SPEED=min_speed
-        self.BASE_SPEED=base_speed
-        self.curL,self.curR = 0.0,0.0
-        self.tarL,self.tarR = 0.0,0.0
-        self.acceleration = 0.95
-        self.encL = Encoder(16,17)
-        self.encR = Encoder(18,19)
-        self.use_encoder=False
+        self.L1 = PWM(Pin(15,0), freq=20000, duty=0)
+        self.L2 = PWM(Pin(13,0), freq=20000, duty=0)
+        self.R1 = PWM(Pin(14,0), freq=20000, duty=0)
+        self.R2 = PWM(Pin(25,0), freq=20000, duty=0)
+        self.MAX_SPEED = max_speed
+        self.MIN_SPEED = min_speed
+        self.BASE_SPEED = base_speed
+        self.curL, self.curR = 0.0, 0.0
+        self.tarL, self.tarR = 0.0, 0.0
+        self.acceleration = 0.88
         self.car_stop()
         print(f"电机初始化 min:{min_speed} base:{base_speed} max:{max_speed}")
+
     def _limit_min(self,sp):
-        if sp>0 and sp<self.MIN_SPEED: return self.MIN_SPEED
-        if sp<0 and sp>-self.MIN_SPEED: return -self.MIN_SPEED
+        if sp>0 and sp<self.MIN_SPEED:
+            return self.MIN_SPEED
+        if sp<0 and sp>-self.MIN_SPEED:
+            return -self.MIN_SPEED
         return sp
+
     def _set_motor(self,l,r):
         l = max(-1023, min(1023, l))
         r = max(-1023, min(1023, r))
         l = self._limit_min(max(-self.MAX_SPEED, min(self.MAX_SPEED,l)))
         r = self._limit_min(max(-self.MAX_SPEED, min(self.MAX_SPEED,r)))
-        self.tarL,self.tarR = l,r
-        self.curL += (self.tarL - self.curL)*self.acceleration
-        self.curR += (self.tarR - self.curR)*self.acceleration
-        la,ra = int(abs(self.curL)), int(abs(self.curR))
+        self.tarL, self.tarR = l, r
+        self.curL += (self.tarL - self.curL) * self.acceleration
+        self.curR += (self.tarR - self.curR) * self.acceleration
+        la, ra = int(abs(self.curL)), int(abs(self.curR))
         la = max(0, min(1023, la))
         ra = max(0, min(1023, ra))
-        self.L1.duty(la if self.curL>=0 else 0)
-        self.L2.duty(la if self.curL<0 else 0)
-        self.R1.duty(ra if self.curR>=0 else 0)
-        self.R2.duty(ra if self.curR<0 else 0)
-    def set_speeds(self,l,r): self._set_motor(l,r)
+        self.L1.duty(la if self.curL >= 0 else 0)
+        self.L2.duty(la if self.curL < 0 else 0)
+        self.R1.duty(ra if self.curR >= 0 else 0)
+        self.R2.duty(ra if self.curR < 0 else 0)
+
+    def set_speeds(self,l,r):
+        self._set_motor(l,r)
+
     def car_stop(self):
-        self.L1.duty(0);self.L2.duty(0);self.R1.duty(0);self.R2.duty(0)
+        self.L1.duty(0)
+        self.L2.duty(0)
+        self.R1.duty(0)
+        self.R2.duty(0)
         self.curL=self.curR=self.tarL=self.tarR=0.0
 
-# ===================== 循迹逻辑【轮速公式修复防外侧甩弯，PID防抖】 =====================
+# ===================== 循迹逻辑 =====================
 class LineFollower:
     def __init__(self, base=650, min_sp=480, max_sp=800):
         self.sensor = PhotoelectricSampler()
         self.motor = MotorController(base, min_sp, max_sp)
-        # 极致防抖PID
-        self.pid = PIDController(kp=1.0, ki=0.008, kd=7.0, output_limits=(-650,650))
+        # 修改PID参数解决直道抖动
+        self.pid = PIDController(kp=0.65, ki=0.006, kd=10.0, output_limits=(-650,650))
         self.no_line_counter = 0
         self.last_pos = 0.0
-        self.lastL,self.lastR = float(base),float(base)
+        self.lastL, self.lastR = float(base), float(base)
         self.running = False
         self.motor.car_stop()
 
@@ -181,93 +154,84 @@ class LineFollower:
         mode = "Straight"
         speed_scale = 1.0
         diff = 0
-        sharp_corner = False
 
-        # 左右直角 完全不变
+        # 直角弯加大转弯力度、降低速度，防止向外甩弯
         if (L1 and L2 and M) and not R2 and not R1:
             mode = "LeftRightAngle"
-            speed_scale = 0.6
-            diff = -320
-            sharp_corner = True
+            speed_scale = 0.55
+            diff = -360
         elif (M and R2 and R1) and not L1 and not L2:
             mode = "RightRightAngle"
-            speed_scale = 0.6
-            diff = 320
-            sharp_corner = True
-        # 单点大弯参数不变
+            speed_scale = 0.55
+            diff = 360
+        # 大弯
         elif L1 == 1 and L2 == 0 and M == 0 and R2 == 0 and R1 == 0:
             mode = "BigLeft"
-            speed_scale = 0.72
-            diff = -240
+            speed_scale = 0.68
+            diff = -280
         elif R1 == 1 and L1 == 0 and L2 == 0 and M == 0 and R2 == 0:
             mode = "BigRight"
-            speed_scale = 0.72
-            diff = 240
-        # 小幅单边弯不变
+            speed_scale = 0.68
+            diff = 280
+        # 小幅弯道
         elif L2 == 1 and L1 == 0 and M == 0 and R2 == 0 and R1 == 0:
             mode = "SlightLeft"
-            speed_scale = 0.94
-            diff = -130
+            speed_scale = 0.88
+            diff = -160
         elif R2 == 1 and L1 == 0 and L2 == 0 and M == 0 and R1 == 0:
             mode = "SlightRight"
-            speed_scale = 0.94
-            diff = 130
-        # 五路全黑十字
+            speed_scale = 0.88
+            diff = 160
         elif sum(bin_arr) == 5:
             mode = "CrossRoad"
             speed_scale = 1.0
             diff = 0
-        # 中间单独直行
         elif M == 1 and L1 == 0 and L2 == 0 and R2 == 0 and R1 == 0:
             mode = "Straight"
             speed_scale = 1.0
             diff = 0
-        # 混合曲线不变
         else:
             mode = "MixedLine"
             speed_scale = 0.94
             if self.last_pos < -0.1:
-                diff = -70
+                diff = -100
             elif self.last_pos > 0.1:
-                diff = 70
+                diff = 100
             else:
                 diff = 0
-        return mode, speed_scale, diff, sharp_corner
+        return mode, speed_scale, diff
 
     def follow_line(self):
         pos, bin_arr, sens = self.sensor.get_line_position()
         total_bin = sum(bin_arr)
         L1, L2, M, R2, R1 = bin_arr
 
-        # 丢线容错保持480帧，搜寻幅度不变
+        #丢线处理
         if total_bin == 0:
             self.no_line_counter += 1
             if self.no_line_counter > 480:
                 self.motor.car_stop()
-                return "stop", pos, bin_arr, sens, 0, 0, 0, 0, "Stop", "LostTimeout"
+                return "stop", pos, bin_arr, sens, 0, 0, 0, "Stop", "LostTimeout"
             search_sp = self.motor.MIN_SPEED + 50
             turn_add = 320
             if self.last_pos < -0.3:
                 self.motor.set_speeds(search_sp, search_sp + turn_add)
-                return "search_left", pos, bin_arr, sens, search_sp, search_sp+turn_add, 0,0,"SearchLeft","Lost_TurnLeft"
+                return "search_left", pos, bin_arr, sens, search_sp, search_sp+turn_add, "SearchLeft","Lost_TurnLeft"
             else:
                 self.motor.set_speeds(search_sp + turn_add, search_sp)
-                return "search_right", pos, bin_arr, sens, search_sp+turn_add, search_sp,0,0,"SearchRight","Lost_TurnRight"
+                return "search_right", pos, bin_arr, sens, search_sp+turn_add, search_sp, "SearchRight","Lost_TurnRight"
 
         self.last_pos = pos
         self.no_line_counter = 0
-        track_mode, speed_scale, base_diff, sharp = self.get_track_mode(bin_arr)
+        track_mode, speed_scale, base_diff = self.get_track_mode(bin_arr)
         corr = self.pid.update(pos)
-        corr = max(-400, min(400, corr))
+        corr = max(-300, min(300, corr))
 
         base_sp = self.motor.BASE_SPEED * speed_scale
-        # ========== 修复：弯道固定差值与PID反向，防止甩外侧 ==========
-        # 原：L = base_sp + base_diff + corr
-        # 现：固定diff与PID修正反向叠加，内侧不会过慢
         L = base_sp + base_diff - corr
         R = base_sp - base_diff + corr
 
-        alpha = 0.86
+        alpha = 0.75
         L = self.lastL * (1 - alpha) + L * alpha
         R = self.lastR * (1 - alpha) + R * alpha
         self.lastL, self.lastR = L, R
@@ -283,17 +247,17 @@ class LineFollower:
             act = "SL" if diff_val < -60 else "L"
         elif diff_val > 20:
             act = "SR" if diff_val > 60 else "R"
-        return act, pos, bin_arr, sens, L, R, 0, corr, act, track_mode
+        return act, pos, bin_arr, sens, L, R, corr, act, track_mode
 
     def run(self, print_int=1):
         print("小车2秒后启动 Ctrl+C停止")
         time.sleep(2)
-        self.running=True
+        self.running = True
         last_print = time.time()
         try:
             while self.running:
                 try:
-                    act, pos, bin_arr, sens, L, R, clv, corr, actname, info = self.follow_line()
+                    act, pos, bin_arr, sens, L, R, corr, actname, info = self.follow_line()
                 except ValueError as e:
                     print("【警告】速度超限，重置PID:", e)
                     self.pid.reset()
@@ -310,7 +274,7 @@ class LineFollower:
         except KeyboardInterrupt:
             print("\n手动停止")
         finally:
-            self.running=False
+            self.running = False
             self.motor.car_stop()
             print("小车已停机")
 
